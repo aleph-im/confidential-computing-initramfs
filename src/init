@@ -1,0 +1,106 @@
+#!/bin/sh
+set -x
+#Create all the symlinks to /bin/busybox
+/bin/busybox --install -s /bin
+
+# Cryptsetup won't start wihtout it
+mkdir /run
+
+#Mount things needed by this script
+mkdir /proc
+mount -t proc proc /proc
+mkdir /sys
+mount -t sysfs sysfs /sys
+
+#Disable kernel messages from popping onto the screen
+echo 0 > /proc/sys/kernel/printk
+
+#Create device nodes
+mknod /dev/null c 1 3
+mknod /dev/tty c 5 0
+mdev -s
+
+#Function for parsing command line options with "=" in them
+# get_opt("init=/sbin/init") will return "/sbin/init"
+get_opt() {
+	echo "$@" | cut -d "=" -f 2
+}
+
+#Defaults
+init="/sbin/init"
+root="/dev/hda1"
+
+#Process command line options
+for i in $(cat /proc/cmdline); do
+	case $i in
+		root\=*)
+			root=$(get_opt $i)
+			;;
+		init\=*)
+			init=$(get_opt $i)
+			;;
+	esac
+done
+
+#Mount the root device
+mount "${root}" /newroot
+
+if [ !  -s "/dev/vda1" ] ; then
+  # create the partition table and one partition take the whole disk
+  # - indicate default
+  # Extract from man sfdisk
+  # The default value of start is the first non-assigned sector aligned according to device I/O limits. [...]
+  # The default value of size indicates "as much as possible"; i.e., until the next partition or end-of-device.
+  sfdisk /dev/vda <<EOF
+label: gpt
+-,-,L,*
+EOF
+  OS_PARTITION_DEVICE_ID="/dev/vda1"
+
+  # Reload devices so the system see the created partition
+  mdev -s
+  echo "Encrypting he OS partition..."
+
+  DISK_PASSWORD=$(
+    tr </dev/urandom -dc _A-Z-a-z-0-9 | head -c${1:-16}
+    echo
+  )
+
+  KEY_FILE="${SCRIPT_DIR}/os_partition.key"
+  echo "Disk password: ${DISK_PASSWORD}"
+  echo -n "${DISK_PASSWORD}" >"${KEY_FILE}"
+
+  cryptsetup --batch-mode --type luks1 --key-file "${KEY_FILE}" luksFormat "${OS_PARTITION_DEVICE_ID}"
+  # load the module
+  # TODO compile that  module in kernel
+  insmod dm-crypt.ko
+  MAPPER_NAME=cr_part
+  MAPPED_DEVICE_ID="/dev/mapper/${MAPPER_NAME}"
+  cryptsetup open --key-file "${KEY_FILE}" "${OS_PARTITION_DEVICE_ID}" "${MAPPER_NAME}"
+  # TODO ext4
+  mkfs.ext2 "${MAPPED_DEVICE_ID}"
+
+  MOUNT_POINT=/newroot/
+  ROOTFS_DIR=/mnt/source
+  mkdir -p "${ROOTFS_DIR}"
+  mount /ubuntu-24.04-minimal-cloudimg-amd64.squashfs "${ROOTFS_DIR}"
+
+  echo "Copying root file system to the new OS partition..."
+  mkdir -p "${MOUNT_POINT}"
+  mount "${MAPPED_DEVICE_ID}" "${MOUNT_POINT}"
+  cp --archive  -t "${MOUNT_POINT}" "${ROOTFS_DIR}"/*
+fi
+
+#Check if $init exists and is executable
+if [ -x "/newroot/${init}" ] ; then
+	#Unmount all other mounts so that the ram used by
+	#the initramfs can be cleared after switch_root
+	umount /sys /proc
+	
+	#Switch to the new root and execute init
+	exec switch_root /newroot "${init}"
+fi
+
+#This will only be run if the exec above failed
+echo "Failed to switch_root, dropping to a shell"
+setsid sh -c 'exec sh </dev/tty1 >/dev/tty1 2>&1'
